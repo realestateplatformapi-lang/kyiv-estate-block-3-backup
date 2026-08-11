@@ -1,4 +1,3 @@
-"""KYIV ESTATE: turn a listing into bilingual Telegraph-ready pages."""
 import base64
 import html
 import hashlib
@@ -26,9 +25,6 @@ from wsgiref.simple_server import WSGIServer, make_server
 
 import truststore
 
-# This is an application entry point, so using the operating-system trust store
-# here is intentional. On Windows it keeps Requests aligned with browsers and
-# CryptoAPI without weakening certificate verification.
 truststore.inject_into_ssl()
 
 import requests
@@ -142,13 +138,6 @@ def init_storage():
 
 
 def reclaim_package_space(keep_id=""):
-    """Free only old, regenerable package caches before accepting a new job.
-
-    A Railway volume is deliberately small.  The package directory is a cache
-    for the browser editor; published Telegraph media is uploaded separately.
-    Keeping the newest packages while pruning stale caches prevents one full
-    disk from taking the public creator offline.
-    """
     if not PACKAGES_ROOT.exists():
         return
     target_free = max(128, int(os.environ.get("KYIV_ESTATE_MIN_FREE_MB", "512"))) * 1024 * 1024
@@ -158,8 +147,6 @@ def reclaim_package_space(keep_id=""):
     except OSError:
         return
     keep_count = max(2, int(os.environ.get("KYIV_ESTATE_PACKAGE_CACHE_KEEP", "6")))
-    # Both folders contain regenerated cache copies.  `listings` has the
-    # originals/finals and is usually larger than `packages`.
     for cache_root in (PACKAGES_ROOT, DATA_ROOT / "listings"):
         if not cache_root.exists():
             continue
@@ -181,9 +168,6 @@ def reclaim_package_space(keep_id=""):
 
 
 def update_job(job_id, input_value, phase, progress=0, snapshot=None, package_path=None, uk_url=None, en_url=None, error=None):
-    # Metadata is useful for progress recovery, but it must never prevent an
-    # otherwise valid listing from being read. Railway's small persistent disk
-    # can temporarily be full while long-lived public packages are retained.
     try:
         with database() as db:
             db.execute("""
@@ -284,11 +268,9 @@ class ListingParser(HTMLParser):
 def reject_unsafe_url(raw):
     parsed = urlparse(raw)
     host = (parsed.hostname or "").lower()
-    # Rieltor agency pages use subdomains, e.g. agency.rieltor.ua.
     valid_host = any(host == domain or host.endswith("." + domain) for domain in ALLOWED_ROOT_DOMAINS)
     if parsed.scheme != "https" or not valid_host:
         raise ValueError("Підтримуються лише HTTPS-посилання на OLX.ua та Rieltor.ua.")
-    # Prevent a DNS-rebinding request from reaching a private host.
     for result in socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM):
         ip = ipaddress.ip_address(result[4][0])
         if not ip.is_global:
@@ -324,7 +306,6 @@ def flatten_jsonld(value):
 
 
 def listing_photo_urls(images, page_url):
-    """Keep listing media and reject site chrome, avatars, icons and payment art."""
     page_host = (urlparse(page_url).hostname or "").lower()
     accepted = []
     for image in images:
@@ -332,9 +313,6 @@ def listing_photo_urls(images, page_url):
         host, path = (parsed.hostname or "").lower(), parsed.path.lower()
         keep = True
         if page_host.endswith("rieltor.ua"):
-            # Rieltor migrated its gallery from market-images to
-            # rieltor-images.lunstatic.net. Both are first-party offer media;
-            # avatars, tiny previews and site art still remain excluded.
             keep = (
                 host in {"market-images.lunstatic.net", "rieltor-images.lunstatic.net"}
                 and ("/images/offers/" in path or "/offers/" in path)
@@ -359,7 +337,6 @@ def extract_listing(source_url):
     session = requests.Session()
     session.headers.update(REQUEST_HEADERS)
     response = None
-    # Respect the site's rate limit rather than immediately issuing another request.
     for attempt in range(2):
         response = session.get(source_url, timeout=20)
         if response.status_code != 429:
@@ -369,8 +346,6 @@ def extract_listing(source_url):
         except ValueError:
             delay = 3
         if attempt == 0:
-            # A normal browser arrives with Rieltor's first-party cookies. Refresh
-            # them once before retrying, while still respecting Retry-After.
             try:
                 session.get("https://rieltor.ua/", timeout=15)
             except requests.RequestException:
@@ -385,8 +360,6 @@ def extract_listing(source_url):
     parser.feed(response.text)
     title = first(parser.meta, "og:title", "twitter:title") or parser.title.strip()
     description = first(parser.meta, "og:description", "description", "twitter:description")
-    # Rieltor's OG description is only a short price/area summary; its full text
-    # is in .offer-view-section-text and is stored first by ListingParser.
     page_text = "\n\n".join(parser.text_blocks)[:20_000]
     if (urlparse(response.url).hostname or "").endswith("rieltor.ua"):
         description_node = BeautifulSoup(response.text, "html.parser").select_one(".offer-view-section-text")
@@ -395,8 +368,6 @@ def extract_listing(source_url):
         description = description or page_text
     images = parser.meta.get("og:image", []) + parser.meta.get("twitter:image", []) + parser.images
     if (urlparse(response.url).hostname or "").endswith("rieltor.ua"):
-        # The current Rieltor gallery keeps full-size images in picture/srcset
-        # attributes instead of img[src]. Extract only non-WebP offer originals.
         images.extend(re.findall(
             r"https://(?:market-images|rieltor-images)\.lunstatic\.net/[^\"'<>\s]*/offers/[^\"'<>\s]+?\.(?:jpe?g|png)(?:\?[^\"'<>\s]*)?",
             response.text,
@@ -424,21 +395,12 @@ def extract_listing(source_url):
     clean_title = sanitize_title(html.unescape(title).strip())
     original_description = strip_listing_references(html.unescape(description)).strip()[:20_000]
     clean_description = sanitize_public_text(original_description)[:20_000]
-    # Rieltor keeps key house facts such as land area in the full offer text,
-    # not in its short OG description or the navigation-heavy page body.
     detail_text = " ".join(parser.meta.get("og:description", [])) + " " + page_plain + " " + original_description
-    # The title carries the listing category on Rieltor and is a more reliable
-    # signal than descriptive copy (which can mention a house nearby, etc.).
     details = extract_details(detail_text, clean_title)
     details.update(extract_contact_details(page_plain))
-    # Keep the original title here: its "- Оголошення №..." suffix marks the
-    # end of Rieltor's structured address.  The cleaned title no longer has it.
     details["address"] = extract_address(detail_text, response.url, html.unescape(title).strip())
     prices = convert_prices(details.get("price"), details.get("currency"))
     clean_images = listing_photo_urls(clean_images, response.url)
-    # Both sources can repeat the same photo under different CDN URLs.  Do the
-    # visual check before showing the editor so duplicates cannot be selected
-    # and published accidentally.
     clean_images = visually_unique_preview_urls(clean_images)
     listing = {
         "internal_id": job_id,
@@ -458,7 +420,6 @@ def extract_listing(source_url):
 
 
 def extract_contact_details(page_text):
-    """Extract public advertiser details for the internal sheet only."""
     text_value = html.unescape(page_text or "")
     lower = text_value.lower()
     if re.search(r"\b(?:ріелтор\w*|риелтор\w*|realtor\w*|агент\w*|broker\w*)\b", lower):
@@ -484,12 +445,9 @@ def extract_details(page_text, classification_text=""):
         found = re.search(pattern, page_text, re.IGNORECASE)
         return found.groups() if found else ()
     price = match(r"(?<!\d)(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(USD|EUR|грн\.?|\$|€|₴)(?!\w)")
-    # Listings often show total/living/kitchen area as "72 / 20 / 30 m²".
     area = match(r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*/\s*\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\s*(?:м²|м2|m²|m2)") or match(r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(?:м²|м2|m²|m2)")
     floor = match(r"(?:поверх|пов\.)\s*(\d+)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*(?:поверх|пов\.)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*поверх\s*(\d+)\s*-?\s*пов") or match(r"(?:поверх|пов\.)\s*(\d+)")
     storeys = match(r"\b(\d+)\s*[-–]?\s*(?:х|x)?\s*поверх\w*") or match(r"(?:поверховість|поверхів|этажность|этажей)\s*[:№-]?\s*(\d+)")
-    # Never accept an arbitrary long number as a room count: on some pages the
-    # number next to the area was incorrectly captured as rooms.
     room_values = []
     for pattern in (
         r"(?:кількість\s+)?(?:кімнат(?:и|а)?|комнат(?:ы|а)?|rooms?)\s*[:№-]?\s*(\d{1,2})(?!\d)",
@@ -499,8 +457,6 @@ def extract_details(page_text, classification_text=""):
     lowered = (classification_text or page_text).casefold()
     property_type = "house" if re.search(r"\b(?:будин\w*|дом\w*|котедж\w*|house\w*|townhouse|таунхаус\w*)\b", lowered) else "commercial" if re.search(r"\b(?:комерц\w*|склад\w*|офіс\w*|магазин\w*|warehouse|office|retail)\b", lowered) else "apartment"
     land = match(r"(?:(?:площа\s+)?(?:земельн\w*\s+)?(?:ділян\w*|участ\w*|land\s+(?:area|plot)?))\s*[:№-]?\s*(\d+(?:[.,]\d+)?)\s*(сот(?:\.?|ок|ки)?|га|гектар\w*|hectares?)")
-    # Rieltor also writes compact fact rows such as "839 м² | 36 соток".
-    # A bare plot unit is unambiguous for a house and must reach the editor.
     if property_type == "house" and not land:
         land = match(r"\b(\d+(?:[.,]\d+)?)\s*(сот(?:\.?|ок|ки)?|га|гектар\w*|hectares?)\b")
     currency = {"$": "USD", "USD": "USD", "€": "EUR", "EUR": "EUR", "₴": "UAH", "грн": "UAH", "грн.": "UAH"}
@@ -513,8 +469,6 @@ def extract_details(page_text, classification_text=""):
 
 
 def extract_address(page_text, source_url, title=""):
-    # Prefer an explicitly published street and building number for every
-    # source.  Never infer a number from unrelated text.
     combined = "\n".join((str(title or ""), str(page_text or "")))
     exact = re.search(
         r"(?<!\w)(?:(?:вул(?:иця)?|ул(?:ица)?|просп(?:ект)?|пр-т|пров(?:улок)?|пер(?:еулок)?|наб(?:ережна)?|бульвар|узвіз)\.?\s+[^,;\n]{1,70}?(?:,\s*)?(?:будинок|буд\.|д\.)?\s*\d{1,4}[а-яіїєґa-z0-9/-]*)",
@@ -524,8 +478,6 @@ def extract_address(page_text, source_url, title=""):
     if exact and "rieltor.ua" not in source_url.lower():
         return re.sub(r"\s+", " ", exact.group(0)).strip(" ,·-")
     if "olx.ua" in source_url.lower():
-        # OLX sometimes exposes only a district, and sometimes a structured
-        # street/house pair.  Use what is actually present in its page state.
         location = re.search(r'\\"location\\":\{([^{}]{0,3000})\}', combined)
         if location:
             values = {}
@@ -548,8 +500,6 @@ def extract_address(page_text, source_url, title=""):
                 return city
     if "rieltor.ua" not in source_url.lower():
         return ""
-    # Rieltor uses: "Продаж квартир: <full address> - Оголошення №...".
-    # This is the clean address, unlike the site's navigation breadcrumbs.
     from_title = re.search(r":\s*(.+?)\s*[-–]\s*(?:Оголошення|Announcement)\b", title, re.IGNORECASE)
     if from_title:
         return re.sub(r"\s+", " ", from_title.group(1)).strip(" ,·-")
@@ -565,7 +515,6 @@ def extract_address(page_text, source_url, title=""):
 
 
 def strip_listing_references(value):
-    """Remove marketplace record numbers; they are not part of a public listing."""
     return re.sub(r"\s*[-–—|·]?\s*(?:оголошення|advertisement|announcement)\s*#?\s*№?\s*\d+\b\s*[:|·—-]*", "", str(value or ""), flags=re.IGNORECASE)
 
 
@@ -604,7 +553,6 @@ def sanitize_public_text(value):
 
 
 def editorial_ai_text(value, title=""):
-    """Create a distinct, polished agency-style description without inventing facts."""
     clean = sanitize_public_text(value)
     if title:
         clean = re.sub(re.escape(sanitize_title(title)), "", clean, flags=re.IGNORECASE)
@@ -622,8 +570,6 @@ def editorial_ai_text(value, title=""):
         intro = "Представляємо ретельно відібрану пропозицію нерухомості з характеристиками, що заслуговують на увагу."
     closing = "Запрошуємо ознайомитися з деталями та оцінити всі переваги об’єкта особисто."
     candidate = "\n\n".join([intro, *paragraphs, closing]).strip()
-    # Guard against a mechanical copy: the AI card must offer a genuinely
-    # different editorial version while keeping every source fact intact.
     original_key = re.sub(r"\W+", "", clean).casefold()
     candidate_key = re.sub(r"\W+", "", candidate).casefold()
     if clean and (candidate_key == original_key or candidate_key.startswith(original_key)):
@@ -632,16 +578,12 @@ def editorial_ai_text(value, title=""):
 
 
 def clean_image_urls(image_urls):
-    """Keep source order, but never request the same source asset twice."""
     cleaned = []
     seen = set()
     for value in image_urls or []:
         if not isinstance(value, str) or not safe_remote_url(value):
             continue
         parsed = urlparse(value.strip())
-        # Fragment identifiers never select a different image and cause false duplicates.
-        # OLX exposes one asset many times with different `;s=WxH` variants.
-        # Its immutable file token is the only part that identifies a photo.
         olx_file = re.search(r"/v1/files/([^/;?]+)/image", parsed.path, re.IGNORECASE)
         normalized = ("olx:" + olx_file.group(1).lower()) if olx_file and parsed.netloc.lower().endswith("olxcdn.com") else urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path, "", "", ""))
         if normalized in seen:
@@ -702,7 +644,6 @@ def translate_to_english(text):
     if not text.strip():
         return ""
     translated = []
-    # Translate paragraph by paragraph so the public endpoint stays within its size limit.
     for part in text.splitlines() or [text]:
         if not part.strip():
             translated.append("")
@@ -722,7 +663,6 @@ def file_sha256(path):
 
 
 def visual_fingerprint(path):
-    """256-bit dHash: catches the same photograph after re-encoding."""
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("L")
         width, height = image.size
@@ -737,9 +677,6 @@ def visual_fingerprint(path):
 
 def visual_fingerprint_bytes(content):
     with Image.open(BytesIO(content)) as source:
-        # Fingerprinting never needs the full image.  Calling convert() on an
-        # original 5–8K OLX JPEG can allocate hundreds of MB and make a small
-        # Railway worker disappear with a 502.  Decode a bounded preview first.
         source.thumbnail((512, 512), Image.Resampling.LANCZOS)
         image = ImageOps.exif_transpose(source).convert("L")
         width, height = image.size
@@ -761,22 +698,16 @@ def same_visual_photo(candidate, fingerprints):
 
 
 def visually_unique_preview_urls(urls):
-    """Remove re-encoded duplicate frames before the browser renders its grid."""
     urls = clean_image_urls(urls)
     def fetch(index_url):
         index, url = index_url
         try:
-            # OLX serves resized gallery derivatives from the same immutable
-            # asset token.  A 512px derivative has the same visual fingerprint
-            # but arrives in milliseconds rather than as a 5–8K original.
             preview_url = re.sub(r";s=\d+x\d+", ";s=512x512", url, flags=re.IGNORECASE)
             with requests.get(preview_url, headers=REQUEST_HEADERS, timeout=8, stream=True) as response:
                 response.raise_for_status()
                 if not response.headers.get("Content-Type", "").lower().startswith("image/"):
                     return index, url, None
                 declared_size = int(response.headers.get("Content-Length") or 0)
-                # URL/token de-duplication still applies to bigger originals;
-                # skip only the optional pixel comparison above this safe cap.
                 if declared_size > 10 * 1024 * 1024:
                     return index, url, None
                 content = bytearray()
@@ -788,9 +719,6 @@ def visually_unique_preview_urls(urls):
         except (requests.RequestException, OSError, ValueError):
             return index, url, None
     fetched = {}
-    # Railway has a small memory envelope.  A few full-resolution OLX images
-    # can be several megabytes each, so bounded concurrency avoids an upstream
-    # 502 while retaining visual de-duplication for every source.
     with ThreadPoolExecutor(max_workers=4) as pool:
         for future in as_completed([pool.submit(fetch, item) for item in enumerate(urls)]):
             index, url, signature = future.result()
@@ -808,7 +736,6 @@ def visually_unique_preview_urls(urls):
 
 
 def display_price(details, prices):
-    """Render the price in all available currencies, in a stable order."""
     symbols = {"UAH": "грн", "USD": "$", "EUR": "€"}
     def format_amount(value):
         number = parse_number(value)
@@ -834,7 +761,6 @@ def display_price(details, prices):
 
 
 def property_detail_rows(details, language):
-    """Return only the fields that make sense for the listing type."""
     uk = language == "uk"
     labels = {
         "price": "Ціна" if uk else "Price",
@@ -865,7 +791,6 @@ def property_detail_rows(details, language):
 
 
 def ensure_local_logo():
-    """Keep the canonical logo on persistent storage for packages and Telegraph."""
     target = DATA_ROOT / "assets" / "kyiv-estate-logo.jpg"
     target.parent.mkdir(parents=True, exist_ok=True)
     if LOGO_PATH and LOGO_PATH.is_file():
@@ -885,7 +810,6 @@ def ensure_local_logo():
 
 
 def telegraph_image(path):
-    """Upload a local D: asset once and reuse its durable Telegraph URL."""
     path = Path(path)
     digest = file_sha256(path)
     cached = None
@@ -898,9 +822,6 @@ def telegraph_image(path):
             raise
     if cached:
         return cached[0]
-    # Telegraph accepts JPEG/PNG but rejects some source WebP files and large
-    # originals. Convert only the outgoing copy; local certified photos stay
-    # untouched for the editor/PDF.
     with Image.open(path) as source:
         image = ImageOps.exif_transpose(source).convert("RGB")
         if max(image.size) > 2560:
@@ -937,7 +858,6 @@ def telegraph_image(path):
 
 
 def github_api(method, path, **kwargs):
-    """Call the repository API without ever placing the token in a public URL."""
     if not MEDIA_GITHUB_REPO or not GITHUB_TOKEN:
         raise RuntimeError("GitHub media storage is not configured.")
     headers = dict(kwargs.pop("headers", {}))
@@ -974,7 +894,6 @@ def ensure_media_branch():
 
 
 def github_media_images(paths, folder):
-    """Commit one listing's missing media atomically and return stable raw URLs."""
     paths = [Path(path) for path in paths]
     head_sha = ensure_media_branch()
     commit = github_api("GET", f"/git/commits/{head_sha}")
@@ -1001,7 +920,6 @@ def github_media_images(paths, folder):
 
 
 def durable_image_urls(paths, folder):
-    """Reuse uploaded assets and batch-publish only missing files."""
     paths = [Path(path) for path in paths]
     cached_urls, missing = {}, []
     try:
@@ -1087,8 +1005,6 @@ def telegraph_content(payload, language, text, images=None, logo_url=None):
     if logo_url:
         content.append({"tag": "img", "attrs": {"src": logo_url}})
     if CONTACT_PHONE:
-        # Telegraph strips tel: links. Use the agency WhatsApp HTTPS address so
-        # the visible phone number remains actionable on published pages.
         phone_digits = re.sub(r"[^0-9]", "", CONTACT_PHONE)
         phone_url = CONTACT_LINKS.get("WhatsApp") or CONTACT_URL or f"https://wa.me/{phone_digits}"
         content.append({"tag": "p", "children": [
@@ -1176,9 +1092,6 @@ def publish_bilingual(payload):
     if not local_images:
         raise ValueError("Немає перевірених фотографій для Telegraph.")
     package_logo = package_root / "assets" / "kyiv-estate-logo.jpg"
-    # Prefer permanently uploaded media.  The public Telegraph upload endpoint
-    # occasionally returns HTTP 400 for otherwise valid JPEGs, so browser mode
-    # has a reliable HTTPS-source fallback instead of failing the whole page.
     try:
         media_urls = durable_image_urls([*local_images, package_logo], job_id)
         image_urls, logo_url = media_urls[:-1], media_urls[-1]
@@ -1216,7 +1129,6 @@ def publish_bilingual(payload):
 
 
 def publish_single_language(payload, language):
-    """Publish one language without creating the other page or its PDF."""
     if language not in {"uk", "en"}:
         raise ValueError("Unsupported publication language.")
     translations = payload.get("translations", {})
@@ -1253,7 +1165,6 @@ def publish_single_language(payload, language):
         page_url = publish_page(title, content)
     urls = {"uk": str(previous.get("uk", "")), "en": str(previous.get("en", ""))}
     urls[language] = page_url
-    # Update reciprocal language links only once the separately-published pair exists.
     if all(urls[item].startswith("https://telegra.ph/") for item in ("uk", "en")):
         for item, label, other in (("uk", "🌐 English", "en"), ("en", "🌐 Українська", "uk")):
             item_version = translations.get(item, {})
@@ -1271,7 +1182,6 @@ def publish_single_language(payload, language):
 
 
 def ai_package_photos(payload):
-    """Ask the existing Windows AI lane to process one listing and return certified files."""
     if not AI_ENDPOINT:
         if AI_BRIDGE_ENABLED:
             return bridge_ai_package_photos(payload)
@@ -1283,8 +1193,6 @@ def ai_package_photos(payload):
         raise RuntimeError("AI endpoint не може використовувати той самий порт, що й вебзастосунок.")
     request_payload = {
         "mode": AI_MODE,
-        # The Windows lane resolves known listings by our stable internal ID.
-        # Source URLs remain supplemental data for browser-only submissions.
         "value": payload.get("internal_id") or payload.get("source"),
         "url": payload.get("source"),
         "title": payload.get("translations", {}).get("uk", {}).get("title", ""),
@@ -1329,7 +1237,6 @@ def ai_package_photos(payload):
 
 
 def bridge_ai_package_photos(payload):
-    """Queue an urgent GPU job for the outbound Windows worker and await its upload."""
     init_storage()
     bridge_id = uuid.uuid4().hex
     now = datetime.now(timezone.utc).isoformat()
@@ -1374,7 +1281,6 @@ def bridge_reply_job(start_response):
 
 
 def download_remote_ai_photos(internal_id, count, headers=None):
-    """Download a certified Windows package when this app runs outside Windows."""
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(internal_id))
     if not safe_id or count < 1 or count > MAX_PHOTOS:
         return []
@@ -1567,7 +1473,6 @@ def render_package_page(language, record, photos):
 
 
 def repair_existing_packages_once():
-    """Repair old static packages after deployment without downloading them again."""
     marker = DATA_ROOT / ".package-repair-v3-visual.complete"
     if marker.exists():
         return
@@ -1617,8 +1522,6 @@ def create_package(payload):
         try:
             previous_record = json.loads(existing_manifest.read_text(encoding="utf-8"))
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as manifest_error:
-            # A full volume can interrupt a prior package write.  That partial
-            # cache must not make every retry for the same listing fail.
             print(f"Discarding incomplete package {job_id}: {manifest_error}", flush=True)
             shutil.rmtree(package_root, ignore_errors=True)
     photos_root = package_root / "photos"
@@ -1635,8 +1538,6 @@ def create_package(payload):
         approved = [approved_by_order[order] for order in requested_order if order in approved_by_order]
     if not approved:
         raise ValueError("Жодну фотографію не вдалося зберегти й перевірити.")
-    # A rebuilt package must contain only the currently checked photographs.
-    # Otherwise files from an earlier, larger selection remain accessible on disk.
     for media_root in (photos_root, originals_root):
         for stale_file in media_root.iterdir():
             if stale_file.is_file():
@@ -1703,7 +1604,6 @@ def sheet_tab_for(payload):
 
 
 def sync_sheet_record(payload, event, pdf_language=""):
-    """Persist every publish/PDF result to an idempotent local outbox and optional Sheets webhook."""
     job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("internal_id", "")))
     if not job_id:
         return
@@ -1836,9 +1736,6 @@ def make_pdf(payload):
 
     def append_pdf_image(source):
         if isinstance(source, (bytes, bytearray)):
-            # The browser flow fetches originals from OLX/Rieltor. Re-encode one
-            # image at a time for the PDF so a large gallery cannot exhaust the
-            # Railway worker's memory before the document is built.
             with PILImage.open(BytesIO(source)) as original:
                 image = ImageOps.exif_transpose(original).convert("RGB")
                 if max(image.size) > 1600:
@@ -1847,8 +1744,6 @@ def make_pdf(payload):
                 encoded = BytesIO()
                 image.save(encoded, format="JPEG", quality=82, optimize=True)
             reader_source = image_source = BytesIO(encoded.getvalue())
-            # ReportLab reads the stream lazily during document.build(). Keep
-            # it alive until then instead of letting the local buffer be freed.
             pdf_image_buffers.append(image_source)
         else:
             reader_source = image_source = str(source)
@@ -1984,8 +1879,6 @@ def app(environ, start_response):
         return reply(start_response, "500 Internal Server Error", {"error": f"Service processing error: {type(error).__name__}: {str(error)[:240]}"})
 
 
-# Railway imports this module once per deployment, which makes the migration
-# safe for the static packages already stored on its persistent volume.
 init_storage()
 repair_existing_packages_once()
 

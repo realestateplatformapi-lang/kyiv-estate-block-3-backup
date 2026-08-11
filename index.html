@@ -57,11 +57,8 @@ $('publish').onclick=async()=>{const button=$('publish');button.disabled=true;tr
 $('downloadPdf').onclick=async()=>{const button=$('downloadPdf');button.disabled=true;message('publishStatus',words[lang].pdf);try{await ensureEnglish();if(processingMode==='ai')await createPackage();const base=payload();for(const language of ['uk','en']){message('publishStatus',`Creating ${language.toUpperCase()} PDF…`);const version={...base,language,title:base.translations[language].title,text:base.translations[language].text},blob=await postPdf(version),url=URL.createObjectURL(blob),link=document.createElement('a');link.href=url;link.download=`${listing.internal_id||'listing'}-${language}.pdf`;document.body.appendChild(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),30000)}message('publishStatus','UA and EN PDFs downloaded.')}catch(e){message('publishStatus',e.message,true)}finally{button.disabled=false}};
 function chooseText(mode){$('textMode').value=mode;$('originalMode').classList.toggle('active',mode==='original');$('aiTextMode').classList.toggle('active',mode==='ai');$('originalCard').classList.toggle('main',mode==='original');$('aiCard').classList.toggle('main',mode==='ai')}$('originalMode').onclick=()=>chooseText('original');$('aiTextMode').onclick=()=>chooseText('ai');$('includeTitle').onchange=()=>{$('titleWrap').classList.toggle('hidden',!$('includeTitle').checked)};new MutationObserver(()=>{if(listing.details?.address)$('address').value=listing.details.address}).observe($('editor'),{attributes:true});$('createAnother').onclick=()=>{listing={};translations={uk:{title:'',text:''},en:{title:'',text:''}};originalTranslations={uk:'',en:''};packageUrls=null;mediaPairs=[];browserItems=[];$('listing').value='';$('editor').hidden=true;setProgress(0);message('status','');$('listing').focus()};renderLanguage();
 </script><script>
-// Separate publication actions: one click produces exactly one language file/page.
 async function languagePayload(language){
   storeCurrent();
-  // Packages retain both text variants for the language switch, but this does
-  // not publish/download the other language. Prepare it silently once here.
   await ensureEnglish();
   const base=payload();
   const mode=$('textMode').value;
