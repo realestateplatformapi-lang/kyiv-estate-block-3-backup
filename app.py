@@ -13,7 +13,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import zipfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from io import BytesIO
@@ -23,9 +23,12 @@ from socketserver import ThreadingMixIn
 from urllib.parse import quote, urljoin, urlparse, urlunparse
 from wsgiref.simple_server import WSGIServer, make_server
 
-import truststore
-
-truststore.inject_into_ssl()
+try:
+    import truststore
+except ImportError:
+    truststore = None
+if truststore:
+    truststore.inject_into_ssl()
 
 import requests
 from bs4 import BeautifulSoup
@@ -45,6 +48,7 @@ MEDIA_GITHUB_REPO = os.environ.get("KYIV_ESTATE_MEDIA_GITHUB_REPO", "").strip()
 MEDIA_GITHUB_BRANCH = os.environ.get("KYIV_ESTATE_MEDIA_GITHUB_BRANCH", "media").strip() or "media"
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "").strip()
 MEDIA_UPLOAD_LOCK = threading.Lock()
+PUBLICATION_LOCK = threading.RLock()
 LOGO_URL = os.environ.get("KYIV_ESTATE_LOGO_URL", "").strip()
 LOGO_PATH = Path(os.environ.get("KYIV_ESTATE_LOGO_PATH", str(ROOT / "assets" / "kyiv-estate-logo.jpg"))).expanduser()
 BUILTIN_LOGO_URL = "https://raw.githubusercontent.com/realestateplatformapi-lang/listing-telegraph/main/assets/kyiv-estate-logo.jpg"
@@ -68,7 +72,7 @@ AI_BRIDGE_ENABLED = os.environ.get("KYIV_ESTATE_AI_BRIDGE_ENABLED", "false").low
 SOURCE_LISTINGS_ROOT = Path(os.environ.get("KYIV_ESTATE_SOURCE_LISTINGS_ROOT", "")) if os.environ.get("KYIV_ESTATE_SOURCE_LISTINGS_ROOT") else None
 AI_REQUIRED = os.environ.get("KYIV_ESTATE_AI_REQUIRED", "false").lower() == "true"
 AI_TIMEOUT_SECONDS = max(60, int(os.environ.get("KYIV_ESTATE_AI_TIMEOUT_SECONDS", "1800")))
-MAX_PHOTOS = max(1, min(100, int(os.environ.get("KYIV_ESTATE_MAX_PHOTOS", "100"))))
+MAX_AI_PHOTOS = max(1, min(100, int(os.environ.get("KYIV_ESTATE_MAX_AI_PHOTOS", "100"))))
 SHEETS_WEBHOOK_URL = os.environ.get(
     "KYIV_ESTATE_SHEETS_WEBHOOK_URL",
     "https://script.google.com/macros/s/AKfycbwKC9uWanGXZVgQPDwlEwj9gYdxL65A6IyVRHxxLWQP4BVGDRRc1WcwPzqgmZfXRS8H/exec",
@@ -135,6 +139,18 @@ def init_storage():
                 error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS publication_state (
+                identity_key TEXT PRIMARY KEY,
+                internal_id TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                uk_url TEXT,
+                en_url TEXT,
+                uk_hash TEXT,
+                en_hash TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
 
 def reclaim_package_space(keep_id=""):
@@ -194,8 +210,39 @@ def normalize_listing_input(raw):
     return value
 
 
+def canonical_listing_url(raw):
+    value = normalize_listing_input(raw)
+    parsed = urlparse(value)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return value.strip()
+    port = f":{parsed.port}" if parsed.port and parsed.port != 443 else ""
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if host.endswith("rieltor.ua"):
+        path = path.rstrip("/") + "/"
+    elif host.endswith("olx.ua"):
+        path = path.rstrip("/")
+    return urlunparse((parsed.scheme.lower() or "https", host + port, path, "", "", ""))
+
+
+def external_listing_id(source_url):
+    canonical = canonical_listing_url(source_url)
+    parsed = urlparse(canonical)
+    host = (parsed.hostname or "").lower()
+    if host.endswith("rieltor.ua"):
+        found = re.search(r"/view/(\d+)(?:/|$)", parsed.path, re.IGNORECASE)
+        if found:
+            return "rieltor:" + found.group(1)
+    if host.endswith("olx.ua"):
+        found = re.search(r"-ID([A-Za-z0-9]+)\.html(?:/|$)", parsed.path, re.IGNORECASE)
+        if found:
+            return "olx:id" + found.group(1).casefold()
+    digest = hashlib.blake2s(canonical.casefold().encode(), digest_size=12).hexdigest()
+    return "url:" + digest
+
+
 def listing_id(source_url):
-    digest = hashlib.blake2s(source_url.strip().lower().encode(), digest_size=8).digest()
+    digest = hashlib.blake2s(external_listing_id(source_url).encode(), digest_size=8).digest()
     return "kyivestate-" + str(10_000_000 + int.from_bytes(digest, "big") % 90_000_000)
 
 
@@ -326,7 +373,7 @@ def listing_photo_urls(images, page_url):
 
 
 def extract_listing(source_url):
-    source_url = normalize_listing_input(source_url)
+    source_url = canonical_listing_url(source_url)
     reject_unsafe_url(source_url)
     job_id = listing_id(source_url)
     update_job(job_id, source_url, "resolve", 10)
@@ -355,6 +402,8 @@ def extract_listing(source_url):
         update_job(job_id, source_url, "error", 10, error="Rieltor rate limit")
         raise ValueError("Rieltor тимчасово обмежив запити. Зачекайте 1–2 хвилини й повторіть спробу.")
     response.raise_for_status()
+    canonical_source = canonical_listing_url(response.url)
+    job_id = listing_id(canonical_source)
     update_job(job_id, source_url, "ingest", 30)
     parser = ListingParser()
     parser.feed(response.text)
@@ -400,18 +449,28 @@ def extract_listing(source_url):
     details.update(extract_contact_details(page_plain))
     details["address"] = extract_address(detail_text, response.url, html.unescape(title).strip())
     prices = convert_prices(details.get("price"), details.get("currency"))
-    clean_images = listing_photo_urls(clean_images, response.url)
-    clean_images = visually_unique_preview_urls(clean_images)
+    discovered_photo_count = len(clean_images)
+    listing_images = listing_photo_urls(clean_images, canonical_source)
+    clean_images = visually_unique_preview_urls(listing_images)
     listing = {
         "internal_id": job_id,
+        "external_id": external_listing_id(canonical_source),
         "title": clean_title,
         "description": clean_description,
         "original_description": original_description,
         "ai_description": editorial_ai_text(original_description, clean_title),
         "images": clean_images,
-        "source": response.url,
+        "source": canonical_source,
         "details": details,
         "prices": prices,
+        "media_audit": {
+            "discovered": discovered_photo_count,
+            "listing_only": len(listing_images),
+            "unique_urls": len(clean_images),
+            "unique_visuals": len(clean_images),
+            "duplicates_removed": max(0, len(listing_images) - len(clean_images)),
+            "method": "source-url-normalization",
+        },
         "phase": "ready",
     }
     LISTING_CACHE[cache_key] = (time.time(), listing)
@@ -445,27 +504,63 @@ def extract_details(page_text, classification_text=""):
         found = re.search(pattern, page_text, re.IGNORECASE)
         return found.groups() if found else ()
     price = match(r"(?<!\d)(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(USD|EUR|грн\.?|\$|€|₴)(?!\w)")
+    price_per_m2 = match(r"(?<!\d)(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(USD|EUR|грн\.?|\$|€|₴)\s*/\s*(?:кв\.?\s*м\.?|м[²2]|m[²2])")
     area = match(r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*/\s*\d+(?:[.,]\d+)?\s*/\s*\d+(?:[.,]\d+)?\s*(?:м²|м2|m²|m2)") or match(r"(\d[\d\s\u00a0]*(?:[.,]\d+)?)\s*(?:м²|м2|m²|m2)")
     floor = match(r"(?:поверх|пов\.)\s*(\d+)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*(?:поверх|пов\.)\s*(?:з|/)\s*(\d+)") or match(r"(\d+)\s*поверх\s*(\d+)\s*-?\s*пов") or match(r"(?:поверх|пов\.)\s*(\d+)")
     storeys = match(r"\b(\d+)\s*[-–]?\s*(?:х|x)?\s*поверх\w*") or match(r"(?:поверховість|поверхів|этажность|этажей)\s*[:№-]?\s*(\d+)")
     room_values = []
     for pattern in (
-        r"(?:кількість\s+)?(?:кімнат(?:и|а)?|комнат(?:ы|а)?|rooms?)\s*[:№-]?\s*(\d{1,2})(?!\d)",
+        r"(?:кількість\s+)(?:кімнат|комнат|rooms?)\s*[:№-]?\s*(\d{1,2})(?!\d)",
         r"\b(\d{1,2})\s*[-–]?\s*(?:кімнат\w*|комнат\w*|rooms?)\b",
+        r"(?:кімнат|комнат|rooms?)\s*[:№-]?\s*(\d{1,2})(?!\s*(?:кв|м[²2]))",
     ):
-        room_values.extend(int(value) for value in re.findall(pattern, page_text, re.IGNORECASE) if 0 < int(value) <= 20)
+        room_values = [int(value) for value in re.findall(pattern, page_text, re.IGNORECASE) if 0 < int(value) <= 20]
+        if room_values:
+            break
     lowered = (classification_text or page_text).casefold()
     property_type = "house" if re.search(r"\b(?:будин\w*|дом\w*|котедж\w*|house\w*|townhouse|таунхаус\w*)\b", lowered) else "commercial" if re.search(r"\b(?:комерц\w*|склад\w*|офіс\w*|магазин\w*|warehouse|office|retail)\b", lowered) else "apartment"
     land = match(r"(?:(?:площа\s+)?(?:земельн\w*\s+)?(?:ділян\w*|участ\w*|land\s+(?:area|plot)?))\s*[:№-]?\s*(\d+(?:[.,]\d+)?)\s*(сот(?:\.?|ок|ки)?|га|гектар\w*|hectares?)")
     if property_type == "house" and not land:
         land = match(r"\b(\d+(?:[.,]\d+)?)\s*(сот(?:\.?|ок|ки)?|га|гектар\w*|hectares?)\b")
+    complex_name = ""
+    complex_match = re.search(
+        r"\b(?:ЖК|житлов(?:ий|ого)\s+комплекс)\s*[«\"“]([^»\"”\n]{2,80})[»\"”]",
+        page_text,
+        re.IGNORECASE,
+    )
+    if complex_match:
+        candidate = re.sub(r"\s+", " ", complex_match.group(1)).strip(" ,.;:-")
+        if not re.search(r"\b(?:продаж|оренд|квартир|будинок|комерц|вул(?:иця)?|район)\b", candidate, re.IGNORECASE):
+            complex_name = candidate
     currency = {"$": "USD", "USD": "USD", "€": "EUR", "EUR": "EUR", "₴": "UAH", "грн": "UAH", "грн.": "UAH"}
     house_storeys = storeys[0] if property_type == "house" and storeys else (floor[0] if property_type == "house" and len(floor) == 1 else "")
     land_area = ""
     if land:
         land_unit = "соток" if land[1].casefold().startswith("сот") else "га" if land[1].casefold().startswith(("га", "гект")) else land[1]
         land_area = f"{land[0]} {land_unit}"
-    return {"price": price[0].strip() if price else "", "currency": currency.get(price[1].upper(), "UAH") if price else "UAH", "area": area[0].strip() if area else "", "floor": floor[0] if floor else "", "total_floors": floor[1] if len(floor) > 1 else house_storeys, "rooms": str(room_values[0]) if room_values else "", "land_area": land_area, "property_type": property_type}
+    def normalized_number(value):
+        value = re.sub(r"[\s\u00a0]+", "", str(value or "")).replace(",", ".")
+        return value if re.fullmatch(r"\d+(?:\.\d+)?", value) else ""
+    normalized_price = normalized_number(price[0]) if price else ""
+    normalized_price_per_m2 = normalized_number(price_per_m2[0]) if price_per_m2 else ""
+    normalized_area = normalized_number(area[0]) if area else ""
+    return {
+        "price": normalized_price,
+        "currency": currency.get(price[1].upper(), "UAH") if price else "UAH",
+        "source_price_raw": " ".join(price) if price else "",
+        "price_amount": normalized_price,
+        "price_currency": currency.get(price[1].upper(), "UAH") if price else "",
+        "price_per_m2": normalized_price_per_m2,
+        "price_per_m2_currency": currency.get(price_per_m2[1].upper(), "UAH") if price_per_m2 else "",
+        "area": normalized_area,
+        "area_total_m2": normalized_area,
+        "floor": floor[0] if floor else "",
+        "total_floors": floor[1] if len(floor) > 1 else house_storeys,
+        "rooms": str(room_values[0]) if room_values else "",
+        "land_area": land_area,
+        "property_type": property_type,
+        "residential_complex": complex_name,
+    }
 
 
 def extract_address(page_text, source_url, title=""):
@@ -542,6 +637,9 @@ def sanitize_public_text(value):
                 r"\b(?:ріелтор\w*|риелтор\w*|realtor\w*|агент\w*|broker\w*)\b",
                 r"\b(?:власник\w*|владелец\w*|owner\w*)\b",
                 r"\b(?:дзвон\w*|звон\w*|телефону\w*|phone|contact\s+me)\b",
+                r"\b(?:оригінал\s+оголошення|оригинал\s+объявления|original\s+listing)\b",
+                r"^\s*(?:оновлено|обновлено|updated)\s*:",
+                r"\b(?:торг\w*|торгів\w*|bargain\w*|negotiable)\b",
             )
             if not sentence or key in seen_sentences or any(phrase in key for phrase in BANNED_PUBLIC_PHRASES) or any(re.search(pattern, key, re.IGNORECASE) for pattern in prohibited):
                 continue
@@ -590,8 +688,6 @@ def clean_image_urls(image_urls):
             continue
         seen.add(normalized)
         cleaned.append(value.strip())
-        if len(cleaned) >= MAX_PHOTOS:
-            break
     return cleaned
 
 
@@ -698,41 +794,10 @@ def same_visual_photo(candidate, fingerprints):
 
 
 def visually_unique_preview_urls(urls):
-    urls = clean_image_urls(urls)
-    def fetch(index_url):
-        index, url = index_url
-        try:
-            preview_url = re.sub(r";s=\d+x\d+", ";s=512x512", url, flags=re.IGNORECASE)
-            with requests.get(preview_url, headers=REQUEST_HEADERS, timeout=8, stream=True) as response:
-                response.raise_for_status()
-                if not response.headers.get("Content-Type", "").lower().startswith("image/"):
-                    return index, url, None
-                declared_size = int(response.headers.get("Content-Length") or 0)
-                if declared_size > 10 * 1024 * 1024:
-                    return index, url, None
-                content = bytearray()
-                for chunk in response.iter_content(256 * 1024):
-                    content.extend(chunk)
-                    if len(content) > 10 * 1024 * 1024:
-                        return index, url, None
-                return index, url, visual_fingerprint_bytes(bytes(content))
-        except (requests.RequestException, OSError, ValueError):
-            return index, url, None
-    fetched = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        for future in as_completed([pool.submit(fetch, item) for item in enumerate(urls)]):
-            index, url, signature = future.result()
-            fetched[index] = (url, signature)
-    result, fingerprints = [], []
-    for index in range(len(urls)):
-        url, signature = fetched.get(index, (urls[index], None))
-        if signature is not None:
-            width, height, value = signature
-            if any(abs(width / max(height, 1) - ow / max(oh, 1)) < 0.012 and (value ^ ov).bit_count() <= 8 for ow, oh, ov in fingerprints):
-                continue
-            fingerprints.append(signature)
-        result.append(url)
-    return result
+    # Do not fetch source photos merely to deduplicate them.  OLX file tokens
+    # and normalized source URLs are stable enough for deterministic dedupe and
+    # keep the server free of photo downloads/caches during extraction.
+    return clean_image_urls(urls)
 
 
 def display_price(details, prices):
@@ -743,20 +808,24 @@ def display_price(details, prices):
             return f"{number:,.0f}".replace(",", " ")
         return str(value).strip().replace("\u00a0", " ")
 
+    primary_amount = parse_number(details.get("price"))
+    unit_amount = parse_number(details.get("price_per_m2"))
+    per_m2 = primary_amount is not None and unit_amount is not None and abs(primary_amount - unit_amount) < 0.0001 and str(details.get("currency", "")).upper() == str(details.get("price_per_m2_currency", "")).upper()
+    suffix = "/м²" if per_m2 else ""
     converted = []
     for code in ("UAH", "USD", "EUR"):
         value = prices.get(code) if isinstance(prices, dict) else ""
         if value:
-            converted.append(f"{format_amount(value)} {symbols[code]}")
+            converted.append(f"{format_amount(value)} {symbols[code]}{suffix}")
     if len(converted) >= 2:
         return " • ".join(converted)
     value = str(details.get("price", "")).strip()
     currency = str(details.get("currency", "")).upper()
     if value and currency:
-        return f"{format_amount(value)} {symbols.get(currency, currency)}"
+        return f"{format_amount(value)} {symbols.get(currency, currency)}{suffix}"
     for code in ("USD", "EUR", "UAH"):
         if prices.get(code):
-            return f"{format_amount(prices[code])} {symbols[code]}"
+            return f"{format_amount(prices[code])} {symbols[code]}{suffix}"
     return ""
 
 
@@ -772,14 +841,18 @@ def property_detail_rows(details, language):
         "land": "Площа ділянки" if uk else "Land area",
         "address": "Адреса" if uk else "Address",
     }
-    area = f"{str(details.get('area')).strip()} м²" if details.get("area") else ""
+    area_value = str(details.get("area", "")).strip()
+    area_number = parse_number(area_value)
+    if area_number is not None and area_number.is_integer():
+        area_value = f"{area_number:,.0f}".replace(",", " ")
+    area = f"{area_value} м²" if area_value else ""
     rooms = f"{details.get('rooms')} {'кімнати' if uk else 'rooms'}" if details.get("rooms") else ""
     kind = details.get("property_type", "apartment")
     rows = [(labels["area"], area)]
     if kind == "house":
-        rows.extend([(labels["rooms"], rooms), (labels["land"], str(details.get("land_area", "")))])
+        rows.extend([(labels["rooms"], rooms), (labels["land"], str(details.get("land_area", ""))), (labels["total_floors"], str(details.get("total_floors", "")))])
     elif kind == "commercial":
-        pass
+        rows.append((labels["floor"], str(details.get("floor", ""))))
     else:  # apartment: floor and total floors are apartment-only facts
         floor = str(details.get("floor", ""))
         total_floors = str(details.get("total_floors", ""))
@@ -996,7 +1069,7 @@ def agency_links():
 def telegraph_content(payload, language, text, images=None, logo_url=None):
     details = payload.get("details", {})
     prices = payload.get("prices", {})
-    images = images if images is not None else [url for url in payload.get("images", []) if isinstance(url, str) and url.startswith("https://")][:MAX_PHOTOS]
+    images = clean_image_urls(images if images is not None else payload.get("images", []))
     price_label, contacts_label = ("Ціна", "Контакти") if language == "uk" else ("Price", "Contacts")
     content = []
     if images:
@@ -1055,130 +1128,173 @@ def publish_page(title, content):
         except (requests.RequestException, ValueError) as error:
             last_error = str(error)
         if attempt < 2:
-            time.sleep(1 + attempt)
+            time.sleep(1.5 * (2 ** attempt))
     raise RuntimeError(last_error or "Telegraph could not create the page.")
-
-    result = requests.post(f"{TELEGRAPH_API}/createPage", json={"access_token": token(), "title": title[:256], "author_name": "KYIV ESTATE", "author_url": CONTACT_URL if CONTACT_URL.startswith("https://") else "", "content": json.dumps(content, ensure_ascii=False), "return_content": False}, timeout=25).json()
-    if not result.get("ok"):
-        raise RuntimeError(result.get("error", "Telegraph не зміг створити сторінку."))
-    return result["result"]["url"]
 
 
 def edit_page(page_url, title, content):
     page_path = urlparse(page_url).path.strip("/")
-    result = requests.post(
-        f"{TELEGRAPH_API}/editPage/{page_path}",
-        json={"access_token": token(), "title": title[:256], "author_name": "KYIV ESTATE", "author_url": CONTACT_URL if CONTACT_URL.startswith("https://") else "", "content": json.dumps(content, ensure_ascii=False), "return_content": False},
-        timeout=25,
-    ).json()
-    if not result.get("ok"):
-        raise RuntimeError(result.get("error", "Telegraph не зміг оновити сторінку."))
-    return result["result"]["url"]
+    if not page_path:
+        raise ValueError("Invalid Telegraph page URL.")
+    last_error = ""
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                f"{TELEGRAPH_API}/editPage/{page_path}",
+                json={"access_token": token(), "title": title[:256], "author_name": "KYIV ESTATE", "author_url": CONTACT_URL if CONTACT_URL.startswith("https://") else "", "content": json.dumps(content, ensure_ascii=False), "return_content": False},
+                timeout=35,
+            )
+            result = response.json()
+            if result.get("ok"):
+                return result["result"]["url"]
+            last_error = str(result.get("error", response.text[:300]))
+        except (requests.RequestException, ValueError) as error:
+            last_error = str(error)
+        if attempt < 2:
+            time.sleep(1.5 * (2 ** attempt))
+    raise RuntimeError(last_error or "Telegraph could not update the page.")
 
 
-def publish_bilingual(payload):
-    translations = payload.get("translations", {})
-    uk = translations.get("uk", {})
-    en = translations.get("en", {})
-    if not uk.get("title") or not uk.get("text") or not en.get("title") or not en.get("text"):
-        raise ValueError("Потрібні готові українська й англійська версії.")
-    job_id = str(payload.get("internal_id") or listing_id(str(payload.get("source", ""))))
-    update_job(job_id, str(payload.get("source", "")), "publishing", 90)
-    package = create_package(payload)
-    package_root = PACKAGES_ROOT / package["internal_id"]
-    manifest_path = package_root / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    local_images = [package_root / "photos" / item["filename"] for item in manifest["photos"]]
-    if not local_images:
-        raise ValueError("Немає перевірених фотографій для Telegraph.")
-    package_logo = package_root / "assets" / "kyiv-estate-logo.jpg"
-    try:
-        media_urls = durable_image_urls([*local_images, package_logo], job_id)
-        image_urls, logo_url = media_urls[:-1], media_urls[-1]
-    except (RuntimeError, requests.RequestException, ValueError) as media_error:
-        source_images = [str(item.get("source_url", "")) for item in manifest.get("photos", [])]
-        if len(source_images) != len(local_images) or not all(url.startswith("https://") for url in source_images):
-            raise RuntimeError(f"Telegraph media upload failed and no source fallback is available: {media_error}") from media_error
-        print(f"Telegraph media fallback for {job_id}: {media_error}", flush=True)
-        image_urls = source_images
-        logo_url = LOGO_URL if LOGO_URL.startswith("https://") else BUILTIN_LOGO_URL
-    show_title = bool(payload.get("include_title"))
-    uk_title = f"{job_id} · {uk['title']}" if show_title else job_id
-    en_title = f"{job_id} · {en['title']}" if show_title else job_id
-    uk_content = telegraph_content(payload, "uk", str(uk["text"]), image_urls, logo_url)
-    en_content = telegraph_content(payload, "en", str(en["text"]), image_urls, logo_url)
-    previous = manifest.get("telegraph", {})
-    if str(previous.get("uk", "")).startswith("https://telegra.ph/") and str(previous.get("en", "")).startswith("https://telegra.ph/"):
-        urls = {"uk": previous["uk"], "en": previous["en"]}
-    else:
-        urls = {
-            "uk": publish_page(uk_title, uk_content),
-            "en": publish_page(en_title, en_content),
-        }
-    uk_content.insert(0, {"tag": "p", "children": [{"tag": "a", "attrs": {"href": urls["en"]}, "children": ["🌐 English"]}]})
-    en_content.insert(0, {"tag": "p", "children": [{"tag": "a", "attrs": {"href": urls["uk"]}, "children": ["🌐 Українська"]}]})
-    edit_page(urls["uk"], uk_title, uk_content)
-    edit_page(urls["en"], en_title, en_content)
-    manifest["telegraph"] = {
-        "uk": urls["uk"], "en": urls["en"], "logo_url": logo_url,
-        "image_urls": image_urls, "published_at": datetime.now(timezone.utc).isoformat(),
-    }
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    update_job(job_id, str(payload.get("source", "")), "published", 100, uk_url=urls["uk"], en_url=urls["en"])
-    return urls
+def publication_identity(payload):
+    source = canonical_listing_url(payload.get("source", ""))
+    if not source.startswith("https://"):
+        raise ValueError("A source listing URL is required for Telegraph.")
+    return external_listing_id(source), listing_id(source), source
 
 
-def publish_single_language(payload, language):
+def publication_state(identity_key, internal_id="", source_url=""):
+    init_storage()
+    with database() as db:
+        row = db.execute(
+            "SELECT internal_id,source_url,uk_url,en_url,uk_hash,en_hash FROM publication_state WHERE identity_key=?",
+            (identity_key,),
+        ).fetchone()
+        if row:
+            return dict(zip(("internal_id", "source_url", "uk_url", "en_url", "uk_hash", "en_hash"), row))
+        job = db.execute(
+            "SELECT uk_url,en_url FROM jobs WHERE id=? OR input_value=? ORDER BY updated_at DESC LIMIT 1",
+            (internal_id, source_url),
+        ).fetchone() if internal_id else None
+    state = {"internal_id": internal_id, "source_url": source_url, "uk_url": job[0] if job else "", "en_url": job[1] if job else "", "uk_hash": "", "en_hash": ""}
+    if not state["uk_url"] and not state["en_url"] and PACKAGES_ROOT.is_dir():
+        for manifest_path in PACKAGES_ROOT.glob("*/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest_source = str(manifest.get("source", ""))
+                if not manifest_source or external_listing_id(manifest_source) != identity_key:
+                    continue
+                previous = manifest.get("telegraph", {})
+                for language in ("uk", "en"):
+                    value = str(previous.get(language, ""))
+                    if value.startswith("https://telegra.ph/"):
+                        state[language + "_url"] = value
+                break
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+    return state
+
+
+def save_publication_state(identity_key, state):
+    with database() as db:
+        db.execute("""
+            INSERT INTO publication_state(identity_key,internal_id,source_url,uk_url,en_url,uk_hash,en_hash)
+            VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(identity_key) DO UPDATE SET
+                internal_id=excluded.internal_id, source_url=excluded.source_url,
+                uk_url=excluded.uk_url, en_url=excluded.en_url,
+                uk_hash=excluded.uk_hash, en_hash=excluded.en_hash,
+                updated_at=CURRENT_TIMESTAMP
+        """, (identity_key, state["internal_id"], state["source_url"], state.get("uk_url", ""), state.get("en_url", ""), state.get("uk_hash", ""), state.get("en_hash", "")))
+
+
+def seeded_telegraph_url(payload, language):
+    candidates = payload.get("telegraph_urls", {}) if isinstance(payload.get("telegraph_urls"), dict) else {}
+    key = "telegraph_url_en" if language == "en" else "telegraph_url"
+    value = candidates.get(language) or payload.get(key) or payload.get("details", {}).get(key)
+    value = str(value or "").strip()
+    return value if value.startswith("https://telegra.ph/") else ""
+
+
+def publication_content_hash(title, content):
+    value = json.dumps({"title": title, "content": content}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _publish_single_language_unlocked(payload, language):
     if language not in {"uk", "en"}:
         raise ValueError("Unsupported publication language.")
     translations = payload.get("translations", {})
     version = translations.get(language, {})
-    if not version.get("title") or not version.get("text"):
+    if not str(version.get("title", "")).strip() or not str(version.get("text", "")).strip():
         raise ValueError("The requested language version is not ready.")
-    job_id = str(payload.get("internal_id") or listing_id(str(payload.get("source", ""))))
-    update_job(job_id, str(payload.get("source", "")), "publishing", 90)
-    package = create_package(payload)
-    package_root = PACKAGES_ROOT / package["internal_id"]
-    manifest_path = package_root / "manifest.json"
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    local_images = [package_root / "photos" / item["filename"] for item in manifest["photos"]]
-    if not local_images:
-        raise ValueError("No verified photographs are available for Telegraph.")
-    package_logo = package_root / "assets" / "kyiv-estate-logo.jpg"
-    try:
-        media_urls = durable_image_urls([*local_images, package_logo], job_id)
-        image_urls, logo_url = media_urls[:-1], media_urls[-1]
-    except (RuntimeError, requests.RequestException, ValueError) as media_error:
-        source_images = [str(item.get("source_url", "")) for item in manifest.get("photos", [])]
-        if len(source_images) != len(local_images) or not all(url.startswith("https://") for url in source_images):
-            raise RuntimeError(f"Telegraph media upload failed and no source fallback is available: {media_error}") from media_error
-        image_urls = source_images
-        logo_url = LOGO_URL if LOGO_URL.startswith("https://") else BUILTIN_LOGO_URL
+    identity_key, job_id, source = publication_identity(payload)
+    image_urls = clean_image_urls(payload.get("images", []))
+    if not image_urls:
+        raise ValueError("At least one direct source photograph is required for Telegraph.")
+    state = publication_state(identity_key, job_id, source)
+    state.update({"internal_id": job_id, "source_url": source})
+    for item in ("uk", "en"):
+        if not str(state.get(item + "_url", "")).startswith("https://telegra.ph/"):
+            state[item + "_url"] = seeded_telegraph_url(payload, item)
+    update_job(job_id, source, "publishing", 90)
     show_title = bool(payload.get("include_title"))
-    title = f"{job_id} · {version['title']}" if show_title else job_id
-    content = telegraph_content(payload, language, str(version["text"]), image_urls, logo_url)
-    previous = manifest.get("telegraph", {})
-    previous_url = str(previous.get(language, ""))
-    if previous_url.startswith("https://telegra.ph/"):
+    logo_url = LOGO_URL if LOGO_URL.startswith("https://") else BUILTIN_LOGO_URL
+
+    def render(item):
+        item_version = translations.get(item, {})
+        item_title = f"{job_id} · {item_version.get('title', '')}" if show_title else job_id
+        item_content = telegraph_content(payload, item, str(item_version.get("text", "")), image_urls, logo_url)
+        other = "en" if item == "uk" else "uk"
+        other_url = str(state.get(other + "_url", ""))
+        if other_url.startswith("https://telegra.ph/"):
+            label = "🌐 English" if item == "uk" else "🌐 Українська"
+            item_content.insert(0, {"tag": "p", "children": [{"tag": "a", "attrs": {"href": other_url}, "children": [label]}]})
+        return item_title, item_content, publication_content_hash(item_title, item_content)
+
+    title, content, digest = render(language)
+    previous_url = str(state.get(language + "_url", ""))
+    unchanged = previous_url.startswith("https://telegra.ph/") and state.get(language + "_hash") == digest
+    if unchanged:
+        page_url = previous_url
+    elif previous_url.startswith("https://telegra.ph/"):
         page_url = edit_page(previous_url, title, content)
     else:
         page_url = publish_page(title, content)
-    urls = {"uk": str(previous.get("uk", "")), "en": str(previous.get("en", ""))}
-    urls[language] = page_url
-    if all(urls[item].startswith("https://telegra.ph/") for item in ("uk", "en")):
-        for item, label, other in (("uk", "🌐 English", "en"), ("en", "🌐 Українська", "uk")):
-            item_version = translations.get(item, {})
-            item_title = f"{job_id} · {item_version['title']}" if show_title else job_id
-            item_content = telegraph_content(payload, item, str(item_version["text"]), image_urls, logo_url)
-            item_content.insert(0, {"tag": "p", "children": [{"tag": "a", "attrs": {"href": urls[other]}, "children": [label]}]})
-            edit_page(urls[item], item_title, item_content)
-    manifest["telegraph"] = {**previous, "uk": urls["uk"], "en": urls["en"], "logo_url": logo_url,
-                             "image_urls": image_urls, "published_at": datetime.now(timezone.utc).isoformat()}
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    update_job(job_id, str(payload.get("source", "")), "published", 100,
-               uk_url=urls["uk"] or None, en_url=urls["en"] or None)
+    state[language + "_url"] = page_url
+    state[language + "_hash"] = digest
+    save_publication_state(identity_key, state)
+
+    other = "en" if language == "uk" else "uk"
+    other_version = translations.get(other, {})
+    other_url = str(state.get(other + "_url", ""))
+    if other_url.startswith("https://telegra.ph/") and str(other_version.get("title", "")).strip() and str(other_version.get("text", "")).strip():
+        other_title, other_content, other_digest = render(other)
+        if state.get(other + "_hash") != other_digest:
+            edit_page(other_url, other_title, other_content)
+            state[other + "_hash"] = other_digest
+            save_publication_state(identity_key, state)
+
+    update_job(job_id, source, "published", 100, uk_url=state.get("uk_url") or None, en_url=state.get("en_url") or None)
+    payload["internal_id"] = job_id
+    payload["external_id"] = identity_key
+    payload["source"] = source
+    payload["telegraph_urls"] = {"uk": state.get("uk_url", ""), "en": state.get("en_url", "")}
     sync_sheet_record(payload, "telegraph")
-    return {"language": language, "url": page_url, "urls": urls}
+    return {"language": language, "url": page_url, "urls": payload["telegraph_urls"], "unchanged": unchanged}
+
+
+def publish_single_language(payload, language):
+    with PUBLICATION_LOCK:
+        return _publish_single_language_unlocked(payload, language)
+
+
+def publish_bilingual(payload):
+    translations = payload.get("translations", {})
+    if any(not translations.get(item, {}).get(field) for item in ("uk", "en") for field in ("title", "text")):
+        raise ValueError("Потрібні готові українська й англійська версії.")
+    publish_single_language(payload, "uk")
+    result = publish_single_language(payload, "en")
+    return result["urls"]
 
 
 def ai_package_photos(payload):
@@ -1282,7 +1398,7 @@ def bridge_reply_job(start_response):
 
 def download_remote_ai_photos(internal_id, count, headers=None):
     safe_id = re.sub(r"[^A-Za-z0-9_-]", "", str(internal_id))
-    if not safe_id or count < 1 or count > MAX_PHOTOS:
+    if not safe_id or count < 1 or count > MAX_AI_PHOTOS:
         return []
     destination = DATA_ROOT / "remote-ai" / safe_id
     destination.mkdir(parents=True, exist_ok=True)
@@ -1312,7 +1428,7 @@ def existing_approved_photos(job_id, image_urls, processing_mode="ai"):
     if not manifest.is_file():
         return []
     record = json.loads(manifest.read_text(encoding="utf-8"))
-    if record.get("selected_source_urls") != list(image_urls[:MAX_PHOTOS]):
+    if record.get("selected_source_urls") != list(image_urls[:MAX_AI_PHOTOS]):
         return []
     if record.get("processing_mode", "ai") != processing_mode:
         return []
@@ -1399,7 +1515,7 @@ def save_approved_photos(job_id, image_urls, payload=None):
                         break
             source_hashes = set()
             source_visual_hashes = []
-            for source_path in candidates[:MAX_PHOTOS]:
+            for source_path in candidates[:MAX_AI_PHOTOS]:
                 digest = file_sha256(source_path)
                 if digest in source_hashes:
                     continue
@@ -1604,9 +1720,11 @@ def sheet_tab_for(payload):
 
 
 def sync_sheet_record(payload, event, pdf_language=""):
-    job_id = re.sub(r"[^a-zA-Z0-9_-]", "", str(payload.get("internal_id", "")))
-    if not job_id:
+    try:
+        identity_key, stable_job_id, canonical_source = publication_identity(payload)
+    except ValueError:
         return
+    job_id = stable_job_id
     package_root = PACKAGES_ROOT / job_id
     manifest_path = package_root / "manifest.json"
     try:
@@ -1616,18 +1734,24 @@ def sync_sheet_record(payload, event, pdf_language=""):
     tab, operation = sheet_tab_for(payload)
     details, prices = payload.get("details", {}), payload.get("prices", {})
     translations = payload.get("translations", {})
-    telegraph = manifest.get("telegraph", {})
+    state = publication_state(identity_key, job_id, canonical_source)
+    telegraph = payload.get("telegraph_urls", {}) if isinstance(payload.get("telegraph_urls"), dict) else {}
+    telegraph = {"uk": telegraph.get("uk") or state.get("uk_url", ""), "en": telegraph.get("en") or state.get("en_url", "")}
     pdf_root = package_root / "pdf"
     row = {
-        "id": job_id, "external_id": job_id, "source": payload.get("source", ""), "operation": operation,
+        "id": job_id, "external_id": identity_key,
+        "source": "OLX" if "olx.ua" in canonical_source else "RIELTOR" if "rieltor.ua" in canonical_source else "",
+        "operation": operation,
         "property_type": details.get("property_type", "apartment"), "title": translations.get("uk", {}).get("title", payload.get("title", "")),
         "description": payload.get("text", ""), "ai_description": translations.get("uk", {}).get("text", ""),
         "price_uah": prices.get("UAH", ""), "price_usd": prices.get("USD", ""), "price_eur": prices.get("EUR", ""),
         "area": details.get("area", ""), "floor": details.get("floor", ""), "floors_total": details.get("total_floors", ""),
         "rooms": details.get("rooms", ""), "district": details.get("district", ""), "city": details.get("city", ""),
         "street": details.get("address", ""), "residential_complex": details.get("residential_complex", ""),
-        "metro_station": details.get("metro_station", ""), "url": payload.get("source", ""),
+        "metro_station": details.get("metro_station", ""), "url": canonical_source,
         "photo_url": (payload.get("images") or [""])[0],
+        "photo_urls_json": json.dumps(clean_image_urls(payload.get("images", [])), ensure_ascii=False),
+        "photo_count": len(clean_image_urls(payload.get("images", []))),
         "agent_type": details.get("agent_type", ""), "agent_name": details.get("agent_name", ""), "agent_phone": details.get("agent_phone", ""),
         "advertiser_type": details.get("agent_type", ""), "contact_name": details.get("agent_name", ""), "phones": details.get("agent_phone", ""),
         "telegraph_url": telegraph.get("uk", ""), "telegraph_url_en": telegraph.get("en", ""),
@@ -1658,7 +1782,15 @@ def sync_sheet_record(payload, event, pdf_language=""):
     )
     for field in parsed_fields:
         row[field] = details.get(field, payload.get(field, ""))
-    envelope = {"spreadsheet_id": "1UmvU7YjDgBpsTBEH4TLIcuVwvkeHzrle6_B6eXUDTU0", "sheet": tab, "key": job_id, "event": event, "secret": SHEETS_WEBHOOK_SECRET, "row": row}
+    envelope = {
+        "spreadsheet_id": "1UmvU7YjDgBpsTBEH4TLIcuVwvkeHzrle6_B6eXUDTU0",
+        "sheet": tab,
+        "key": identity_key,
+        "event": event,
+        "write_policy": "preserve_manual_and_nonempty",
+        "preserve_fields": ["Коментарі", "comments", "admin_notes"],
+        "row": row,
+    }
     SHEETS_OUTBOX_ROOT.mkdir(parents=True, exist_ok=True)
     outbox_file = SHEETS_OUTBOX_ROOT / f"{job_id}.json"
     outbox_file.write_text(json.dumps(envelope, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1667,12 +1799,24 @@ def sync_sheet_record(payload, event, pdf_language=""):
             headers = {"Content-Type": "application/json"}
             if SHEETS_WEBHOOK_SECRET:
                 headers["X-Kyiv-Estate-Signature"] = SHEETS_WEBHOOK_SECRET
-            response = requests.post(SHEETS_WEBHOOK_URL, json=envelope, headers=headers, timeout=12)
-            response.raise_for_status()
-            if not response.json().get("ok"):
-                raise RuntimeError("Google Sheets rejected the publication record")
-        except requests.RequestException as error:
-            print(f"Sheets sync queued for {job_id}: {error}", flush=True)
+            request_envelope = {**envelope, "secret": SHEETS_WEBHOOK_SECRET} if SHEETS_WEBHOOK_SECRET else envelope
+            last_error = None
+            for attempt in range(3):
+                try:
+                    response = requests.post(SHEETS_WEBHOOK_URL, json=request_envelope, headers=headers, timeout=12)
+                    response.raise_for_status()
+                    if not response.json().get("ok"):
+                        raise RuntimeError("Google Sheets rejected the publication record")
+                    last_error = None
+                    break
+                except (requests.RequestException, RuntimeError, ValueError) as error:
+                    last_error = error
+                    if attempt < 2:
+                        time.sleep(1.5 * (2 ** attempt))
+            if last_error:
+                raise last_error
+        except (requests.RequestException, RuntimeError, ValueError) as error:
+            print(json.dumps({"event": "sheets_sync_queued", "listing": identity_key, "error": str(error)[:300]}, ensure_ascii=False), flush=True)
 
 
 def make_pdf(payload):
@@ -1729,9 +1873,9 @@ def make_pdf(payload):
             manifest_path = PACKAGES_ROOT / job_id / "manifest.json"
             if manifest_path.is_file():
                 manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                local_photos = [local_root / item["filename"] for item in manifest.get("photos", []) if (local_root / item.get("filename", "")).is_file()][:MAX_PHOTOS]
+                local_photos = [local_root / item["filename"] for item in manifest.get("photos", []) if (local_root / item.get("filename", "")).is_file()][:MAX_AI_PHOTOS]
             else:
-                local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:MAX_PHOTOS]
+                local_photos = sorted(path for path in local_root.iterdir() if path.is_file())[:MAX_AI_PHOTOS]
     pdf_image_buffers = []
 
     def append_pdf_image(source):
@@ -1758,7 +1902,7 @@ def make_pdf(payload):
     if local_photos:
         photo_sources = local_photos
     else:
-        photo_sources = (url for url in payload.get("images", [])[:MAX_PHOTOS] if safe_remote_url(url))
+        photo_sources = (url for url in clean_image_urls(payload.get("images", [])) if safe_remote_url(url))
     for source in photo_sources:
         try:
             if isinstance(source, str) and source.startswith("https://"):
@@ -1795,6 +1939,38 @@ def make_pdf(payload):
     return body
 
 
+def make_photo_zip(payload):
+    image_urls = clean_image_urls(payload.get("images", []))
+    if not image_urls:
+        raise ValueError("No direct source photographs are selected.")
+    output = BytesIO()
+    with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for index, url in enumerate(image_urls, 1):
+            if not safe_remote_url(url):
+                raise ValueError(f"Unsafe photograph URL at position {index}.")
+            last_error = None
+            for attempt in range(3):
+                try:
+                    response = requests.get(url, headers=REQUEST_HEADERS, timeout=20)
+                    response.raise_for_status()
+                    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                    if not content_type.startswith("image/"):
+                        raise ValueError(f"Source item {index} is not an image.")
+                    extension = mimetypes.guess_extension(content_type) or Path(urlparse(url).path).suffix or ".jpg"
+                    if extension == ".jpe":
+                        extension = ".jpg"
+                    archive.writestr(f"{index:03d}{extension}", response.content)
+                    last_error = None
+                    break
+                except (requests.RequestException, ValueError) as error:
+                    last_error = error
+                    if attempt < 2:
+                        time.sleep(1.5 * (2 ** attempt))
+            if last_error:
+                raise RuntimeError(f"Could not download source photograph {index}: {last_error}")
+    return output.getvalue()
+
+
 def reply(start_response, status, data):
     body = json.dumps(data, ensure_ascii=False).encode()
     start_response(status, [("Content-Type", "application/json; charset=utf-8"), ("Content-Length", str(len(body)))])
@@ -1803,6 +1979,11 @@ def reply(start_response, status, data):
 
 def pdf_reply(start_response, body):
     start_response("200 OK", [("Content-Type", "application/pdf"), ("Content-Disposition", "attachment; filename=listing.pdf"), ("Content-Length", str(len(body)))])
+    return [body]
+
+
+def zip_reply(start_response, body, filename="kyiv-estate-photos.zip"):
+    start_response("200 OK", [("Content-Type", "application/zip"), ("Content-Disposition", f'attachment; filename="{filename}"'), ("Content-Length", str(len(body))), ("Cache-Control", "no-store")])
     return [body]
 
 
@@ -1856,7 +2037,7 @@ def app(environ, start_response):
             body = requested.read_bytes()
             start_response("200 OK", [("Content-Type", content_type), ("Content-Length", str(len(body)))])
             return [body]
-        if path in {"/api/extract", "/api/publish", "/api/translate", "/api/pdf", "/api/package"} and method == "POST":
+        if path in {"/api/extract", "/api/publish", "/api/translate", "/api/pdf", "/api/photos", "/api/package"} and method == "POST":
             length = int(environ.get("CONTENT_LENGTH") or 0)
             if length <= 0 or length > 2_000_000:
                 return reply(start_response, "413 Payload Too Large", {"error": "Некоректний розмір запиту."})
@@ -1867,8 +2048,10 @@ def app(environ, start_response):
                 return reply(start_response, "200 OK", {"title": translate_to_english(str(payload.get("title", ""))), "text": translate_to_english(str(payload.get("text", "")))})
             if path.endswith("pdf"):
                 return pdf_reply(start_response, make_pdf(payload))
+            if path.endswith("photos"):
+                return zip_reply(start_response, make_photo_zip(payload))
             if path.endswith("package"):
-                return reply(start_response, "200 OK", create_package(payload))
+                return reply(start_response, "410 Gone", {"error": "Server-side photo packages are disabled; direct source URLs are used."})
             language = str(payload.get("language", "uk"))
             return reply(start_response, "200 OK", publish_single_language(payload, language))
         return reply(start_response, "404 Not Found", {"error": "Не знайдено"})

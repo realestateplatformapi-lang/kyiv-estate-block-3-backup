@@ -2,6 +2,8 @@ import json
 import base64
 import tempfile
 import unittest
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from pathlib import Path
 from unittest import mock
@@ -62,6 +64,9 @@ class AppTests(unittest.TestCase):
             "MEDIA_GITHUB_REPO": app.MEDIA_GITHUB_REPO,
             "MEDIA_GITHUB_BRANCH": app.MEDIA_GITHUB_BRANCH,
             "GITHUB_TOKEN": app.GITHUB_TOKEN,
+            "SHEETS_WEBHOOK_URL": app.SHEETS_WEBHOOK_URL,
+            "SHEETS_WEBHOOK_SECRET": app.SHEETS_WEBHOOK_SECRET,
+            "SHEETS_OUTBOX_ROOT": app.SHEETS_OUTBOX_ROOT,
         }
         app.DATA_ROOT = root / "data"
         app.PACKAGES_ROOT = app.DATA_ROOT / "packages"
@@ -79,6 +84,9 @@ class AppTests(unittest.TestCase):
         app.MEDIA_GITHUB_REPO = ""
         app.MEDIA_GITHUB_BRANCH = "media"
         app.GITHUB_TOKEN = ""
+        app.SHEETS_WEBHOOK_URL = ""
+        app.SHEETS_WEBHOOK_SECRET = ""
+        app.SHEETS_OUTBOX_ROOT = app.DATA_ROOT / "sheets_outbox"
         app.init_storage()
 
     def tearDown(self):
@@ -178,6 +186,10 @@ class AppTests(unittest.TestCase):
         self.assertEqual(details["property_type"], "apartment")
         self.assertEqual(details["rooms"], "")
 
+    def test_explicit_room_count_wins_over_room_area(self):
+        text = "Кімната 12 кв. м. Спальні 19 і 13 кв. м. Планування. Кількість кімнат: 4. Загальна площа: 149 м²."
+        self.assertEqual(app.extract_details(text, "Продаж будинку")["rooms"], "4")
+
     def test_cleaned_title_does_not_replace_rieltor_address_source(self):
         raw_title = "Продаж квартир: Мечникова вул. (Кловський), 11-А, Печерський р-н, Київ - Оголошення №12519316"
         cleaned_title = app.sanitize_title(raw_title)
@@ -203,7 +215,9 @@ class AppTests(unittest.TestCase):
         self.assertIn('<textarea id="originalText">', interface)
         self.assertIn('<textarea id="text">', interface)
         self.assertIn("originalTranslations", interface)
-        self.assertIn("Download PDFs (UA + EN)", interface)
+        self.assertIn("Download PDF · Ukrainian", interface)
+        self.assertIn("Download PDF · English", interface)
+        self.assertIn("Download all photos", interface)
         self.assertGreater(interface.index('id="topUk"'), interface.index('id="extract"'))
 
     def test_initial_ai_request_does_not_look_like_all_photos_unchecked(self):
@@ -299,25 +313,110 @@ class AppTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(post.call_count, 1)
 
-    @mock.patch.object(app, "edit_page")
-    @mock.patch.object(app, "publish_page")
-    @mock.patch.object(app, "telegraph_image")
-    @mock.patch.object(app, "safe_remote_url", return_value=True)
-    @mock.patch.object(app.requests, "get")
-    def test_publish_saves_bilingual_urls_in_manifest(self, get, _safe, upload, publish, edit):
-        get.return_value = FakeResponse(content=b"image" * 1024)
-        upload.side_effect = lambda path: "https://telegra.ph/file/logo.jpg" if Path(path).name == "kyiv-estate-logo.jpg" else "https://telegra.ph/file/photo.jpg"
-        publish.side_effect = ["https://telegra.ph/ua-page", "https://telegra.ph/en-page"]
-        edit.side_effect = lambda page_url, _title, _content: page_url
-        urls = app.publish_bilingual(self.payload())
-        manifest = json.loads((app.PACKAGES_ROOT / "203781/manifest.json").read_text(encoding="utf-8"))
-        self.assertEqual(urls["uk"], "https://telegra.ph/ua-page")
-        self.assertEqual(manifest["telegraph"]["en"], "https://telegra.ph/en-page")
-        self.assertEqual(edit.call_count, 2)
-        second = app.publish_bilingual(self.payload())
-        self.assertEqual(second, urls)
-        self.assertEqual(publish.call_count, 2)
-        self.assertEqual(edit.call_count, 4)
+    def test_publish_uses_direct_urls_and_is_idempotent(self):
+        payload = self.payload()
+        with mock.patch.object(app, "safe_remote_url", return_value=True), \
+             mock.patch.object(app, "sync_sheet_record"), \
+             mock.patch.object(app, "publish_page", side_effect=["https://telegra.ph/ua-page", "https://telegra.ph/en-page"]) as publish, \
+             mock.patch.object(app, "edit_page", side_effect=lambda page_url, _title, _content: page_url) as edit:
+            urls = app.publish_bilingual(payload)
+            self.assertEqual(urls, {"uk": "https://telegra.ph/ua-page", "en": "https://telegra.ph/en-page"})
+            self.assertEqual(publish.call_count, 2)
+            self.assertEqual(edit.call_count, 1)
+            first_content = publish.call_args_list[0].args[1]
+            self.assertIn("https://images.example/photo.jpg", json.dumps(first_content))
+            stable_job_id = app.listing_id(payload["source"])
+            self.assertFalse((app.PACKAGES_ROOT / stable_job_id).exists())
+
+            second = app.publish_bilingual(payload)
+            self.assertEqual(second, urls)
+            self.assertEqual(publish.call_count, 2)
+            self.assertEqual(edit.call_count, 1)
+
+            payload["images"].append("https://images.example/second.jpg")
+            changed = app.publish_single_language(payload, "uk")
+            self.assertFalse(changed["unchanged"])
+            self.assertEqual(publish.call_count, 2)
+            self.assertEqual(edit.call_count, 3)
+
+    def test_publish_adopts_legacy_manifest_page_instead_of_creating_duplicate(self):
+        payload = self.payload()
+        legacy = app.PACKAGES_ROOT / "old-url-hash"
+        legacy.mkdir(parents=True)
+        (legacy / "manifest.json").write_text(json.dumps({
+            "source": payload["source"] + "?utm_source=legacy",
+            "telegraph": {"uk": "https://telegra.ph/existing-ua"},
+        }), encoding="utf-8")
+        with mock.patch.object(app, "safe_remote_url", return_value=True), \
+             mock.patch.object(app, "sync_sheet_record"), \
+             mock.patch.object(app, "publish_page") as publish, \
+             mock.patch.object(app, "edit_page", return_value="https://telegra.ph/existing-ua") as edit:
+            result = app.publish_single_language(payload, "uk")
+        self.assertEqual(result["url"], "https://telegra.ph/existing-ua")
+        publish.assert_not_called()
+        edit.assert_called_once()
+
+    def test_concurrent_publish_creates_only_one_page(self):
+        payloads = [json.loads(json.dumps(self.payload())) for _ in range(2)]
+        with mock.patch.object(app, "safe_remote_url", return_value=True), \
+             mock.patch.object(app, "sync_sheet_record"), \
+             mock.patch.object(app, "publish_page", return_value="https://telegra.ph/one-page") as publish, \
+             ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda item: app.publish_single_language(item, "uk"), payloads))
+        self.assertEqual([item["url"] for item in results], ["https://telegra.ph/one-page"] * 2)
+        self.assertEqual(publish.call_count, 1)
+
+    def test_canonical_identity_ignores_tracking_and_photo_list_has_no_count_limit(self):
+        base = "https://www.olx.ua/d/uk/obyavlenie/example-IDAbC123.html"
+        tracked = base + "?utm_source=test#gallery"
+        self.assertEqual(app.external_listing_id(base), "olx:idabc123")
+        self.assertEqual(app.listing_id(base), app.listing_id(tracked))
+        urls = [f"https://images.example/{index}.jpg?width=1600" for index in range(135)]
+        with mock.patch.object(app, "safe_remote_url", return_value=True):
+            self.assertEqual(len(app.clean_image_urls(urls)), 135)
+
+    def test_data_normalization_and_public_text_guards(self):
+        details = app.extract_details('Продаж будинку у ЖК «River Park». 200 000 $ 1 000 м². 7 кімнат. Поверхів: 3')
+        self.assertEqual(details["area"], "1000")
+        self.assertEqual(details["rooms"], "7")
+        self.assertEqual(details["residential_complex"], "River Park")
+        self.assertEqual(app.extract_details("Житловий комплекс поруч. Квартира 70 м²")["residential_complex"], "")
+        cleaned = app.sanitize_public_text("Гарний об'єкт. Оригінал оголошення: OLX. Оновлено: сьогодні. Торг можливий.")
+        self.assertEqual(cleaned, "Гарний об'єкт.")
+
+    def test_commercial_price_per_square_meter_is_not_presented_as_total(self):
+        details = app.extract_details("Оренда офісів. Загальна площа 10 000 м². Оренда від 265 грн/кв.м.", "Оренда комерції")
+        self.assertEqual(details["price"], "265")
+        self.assertEqual(details["price_per_m2"], "265")
+        self.assertEqual(app.display_price(details, {"UAH": "265", "USD": "6", "EUR": "5"}), "265 грн/м² • 6 $/м² • 5 €/м²")
+        house = app.extract_details("Будинок 149 м². Ціна 169 000 $. Вартість 1 134 $/м².", "Продаж будинку")
+        self.assertEqual(house["price"], "169000")
+        self.assertEqual(house["price_per_m2"], "1134")
+        self.assertEqual(app.display_price(house, {"UAH": "7500000", "USD": "169000", "EUR": "145000"}), "7 500 000 грн • 169 000 $ • 145 000 €")
+
+    def test_photo_zip_is_in_memory_and_keeps_all_unique_urls(self):
+        payload = self.payload()
+        payload["images"] = ["https://images.example/one.jpg", "https://images.example/two.jpg"]
+        with mock.patch.object(app, "safe_remote_url", return_value=True), mock.patch.object(app.requests, "get") as get:
+            get.side_effect = [FakeResponse(content=b"one"), FakeResponse(content=b"two")]
+            body = app.make_photo_zip(payload)
+        with zipfile.ZipFile(BytesIO(body)) as archive:
+            self.assertEqual(archive.namelist(), ["001.jpg", "002.jpg"])
+        self.assertFalse(any(path.is_file() for path in app.PACKAGES_ROOT.rglob("*.jpg")))
+
+    def test_sheet_outbox_uses_external_identity_and_does_not_persist_secret(self):
+        app.SHEETS_WEBHOOK_SECRET = "do-not-store-this-secret"
+        payload = self.payload()
+        with mock.patch.object(app, "safe_remote_url", return_value=True):
+            app.sync_sheet_record(payload, "telegraph")
+        stable_job_id = app.listing_id(payload["source"])
+        outbox = app.SHEETS_OUTBOX_ROOT / f"{stable_job_id}.json"
+        raw = outbox.read_text(encoding="utf-8")
+        envelope = json.loads(raw)
+        self.assertEqual(envelope["key"], "rieltor:203781")
+        self.assertEqual(envelope["row"]["external_id"], "rieltor:203781")
+        self.assertNotIn("do-not-store-this-secret", raw)
+        self.assertEqual(envelope["write_policy"], "preserve_manual_and_nonempty")
 
     @mock.patch.object(app.requests, "get")
     @mock.patch.object(app.requests, "post")
