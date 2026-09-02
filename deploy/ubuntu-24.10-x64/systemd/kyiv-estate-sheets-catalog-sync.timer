@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the canonical Google Sheets catalog every two hours
+
+[Timer]
+OnCalendar=*-*-* 00/2:30:00
+RandomizedDelaySec=10m
+Persistent=true
+AccuracySec=1m
+Unit=kyiv-estate-sheets-catalog-sync.service
+
+[Install]
+WantedBy=timers.target

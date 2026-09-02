@@ -1,0 +1,24 @@
+[Unit]
+Description=KYIV ESTATE bounded Google Sheets catalog mirror
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=kyivestate
+Group=kyivestate
+WorkingDirectory=/opt/kyiv-estate-block-1
+EnvironmentFile=/etc/kyiv-estate/block-1.env
+ExecStart=/opt/kyiv-estate-block-1/venv/bin/python /opt/kyiv-estate-block-1/parser_v2/scripts/sync_google_sheets_catalog.py --batch-size 1000 --delay 1.0
+Nice=10
+CPUQuota=25%
+MemoryHigh=192M
+MemoryMax=256M
+TasksMax=32
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
