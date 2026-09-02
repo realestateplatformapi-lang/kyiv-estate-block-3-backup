@@ -2,9 +2,12 @@
 Description=KYIV ESTATE bounded Google Sheets catalog mirror
 After=network-online.target postgresql.service
 Wants=network-online.target
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
+Restart=on-failure
+RestartSec=10min
 User=kyivestate
 Group=kyivestate
 WorkingDirectory=/opt/kyiv-estate-block-1

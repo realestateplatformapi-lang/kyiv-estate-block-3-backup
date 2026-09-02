@@ -367,7 +367,7 @@ def main() -> int:
     with production_lock(args.lock_file) as acquired:
         if not acquired:
             log("sync_deferred", reason="production_heavy_lock_busy")
-            return 0
+            return 75
 
         connection = None if args.dry_run else connect_database()
         try:
